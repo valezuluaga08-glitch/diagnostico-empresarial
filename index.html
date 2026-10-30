@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Diagnóstico empresarial para tu empresa</title>
+<meta name="description" content="Evalúa el nivel de madurez de tu empresa en seis áreas y recibe un análisis con fortalezas, alertas y plan de acción.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="icon" type="image/png" href="logo-uco-icono.png">
+<link rel="stylesheet" href="estilos.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="config.js"></script>
+<script src="banco.js"></script>
+<script src="nucleo.js"></script>
+</head>
+<body>
+<header class="brandbar"><div class="in"><img src="logo-uco.png" alt="Universidad Católica de Oriente" width="140" height="52"><p class="sp"><b>Diagnóstico empresarial</b>Con el apoyo de la Universidad Católica de Oriente</p></div></header>
+<main class="wrap" id="app" aria-live="polite"></main>
+<footer class="sitefoot"><img src="logo-uco-icono.png" alt="" width="28" height="28"><span>Con el apoyo de la Universidad Católica de Oriente · NIT 809.984.746-7</span></footer>
+
+<script>
+(function(){
+"use strict";
+const D=window.DIAG;
+const {AREAS,SCALE,PERFIL,ACTIVIDADES,LEVELS,levelOf,levelIdx,esc,fmt,scaleName,areaApplies,subApplies,itemApplies,pending,progress,compute,summaryText,radarSVG}=D;
+const app=document.getElementById("app");
+
+/* ---------- Almacenamiento: Supabase o, si no está configurado, este navegador ---------- */
+const CFG=window.DIAG_CONFIG||{};
+const configured=CFG.SUPABASE_URL&&!/TU-PROYECTO/.test(CFG.SUPABASE_URL)&&CFG.SUPABASE_ANON_KEY&&!/PEGA_AQUI/.test(CFG.SUPABASE_ANON_KEY);
+let db=null;
+try{if(configured&&window.supabase)db=window.supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY,{auth:{persistSession:false}})}catch(e){}
+const LKEY=n=>"diag-v4-empresa-"+n;
+const lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||"null")}catch(e){return null}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+const Store=db?{
+ async load(nit,code){const {data,error}=await db.rpc("empresa_cargar",{p_nit:nit,p_codigo:code});if(error)throw error;return data},
+ async save(nit,code,datos,resp,env){const {data,error}=await db.rpc("empresa_guardar",{p_nit:nit,p_codigo:code,p_datos:datos,p_respuestas:resp,p_enviado:!!env});if(error)throw error;return data},
+ async submit(row){const {error}=await db.from("diagnosticos").insert(row);if(error&&error.code!=="23505")throw error}
+}:{
+ async load(nit,code){const r=lsGet(LKEY(nit));if(!r)return {estado:"nuevo"};if(r.codigo!==code)return {estado:"codigo_incorrecto"};return {estado:"ok",datos:r.datos,respuestas:r.respuestas,ultimo_envio:r.ultimo_envio}},
+ async save(nit,code,datos,resp,env){const r=lsGet(LKEY(nit));if(r&&r.codigo!==code)return {estado:"codigo_incorrecto"};lsSet(LKEY(nit),{codigo:code,datos,respuestas:resp,ultimo_envio:env?new Date().toISOString():(r&&r.ultimo_envio)||null});return {estado:"ok"}},
+ async submit(){}
+};
+
+/* ---------- Estado de la sesión ---------- */
+const SKEY="diag-v4-sesion";
+const uuid=()=>(window.crypto&&crypto.randomUUID)?crypto.randomUUID():"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return (c==="x"?r:(r&3|8)).toString(16)});
+const blankEmpresa=()=>({nombre:"",nit:"",tamano:"",ciudad:"",responsable:"",cargo:"",correo:"",celular:""});
+const blank=()=>({view:"acceso",nit:"",codigo:"",empresa:blankEmpresa(),perfil:{},consent:false,answers:{},area:0,enviado:false,fecha:null,ultimo_envio:null,msg:null});
+let S=blank();
+try{const raw=sessionStorage.getItem(SKEY);if(raw)S=Object.assign(blank(),JSON.parse(raw))}catch(e){}
+const persist=()=>{try{sessionStorage.setItem(SKEY,JSON.stringify(S))}catch(e){}};
+const rec=()=>({empresa:S.empresa,perfil:S.perfil,answers:S.answers});
+const datosPayload=()=>({empresa:S.empresa,perfil:S.perfil,consent:S.consent});
+
+/* ---------- Guardado automático ---------- */
+let saveTimer=null,saveState={st:"idle",at:null};
+function setSave(st){saveState={st,at:st==="ok"?new Date():saveState.at};const el=document.getElementById("savest");if(el)el.innerHTML=saveLabel()}
+function saveLabel(){
+ if(!S.codigo)return `<span class="dot off"></span>Sin código de acceso: el avance no se guarda si cierras la página`;
+ if(!db)return `<span class="dot"></span>Avance guardado en este navegador`;
+ if(saveState.st==="busy")return `<span class="dot busy"></span>Guardando…`;
+ if(saveState.st==="err")return `<span class="dot off"></span>Sin conexión: se intentará guardar de nuevo`;
+ if(saveState.st==="ok")return `<span class="dot"></span>Avance guardado ${saveState.at.toLocaleTimeString("es-CO",{hour:"2-digit",minute:"2-digit"})}`;
+ return `<span class="dot"></span>El avance se guarda automáticamente`;
+}
+function queueSave(delay){persist();clearTimeout(saveTimer);saveTimer=setTimeout(saveNow,delay==null?1200:delay)}
+async function saveNow(enviado){
+ clearTimeout(saveTimer);if(!S.nit||!S.codigo)return false;
+ setSave("busy");
+ try{const r=await Store.save(S.nit,S.codigo,datosPayload(),S.answers,enviado);
+  if(r&&r.estado==="ok"){setSave("ok");return true}
+  setSave("err");return false}
+ catch(e){setSave("err");saveTimer=setTimeout(saveNow,15000);return false}
+}
+window.addEventListener("pagehide",()=>{if(saveTimer)saveNow()});
+
+/* ---------- Vistas ---------- */
+function render(){
+ if(S.view==="perfil")return renderPerfil();
+ if(S.view==="cuestionario")return renderQ();
+ if(S.view==="resultados")return renderR();
+ renderAcceso();
+}
+const go=v=>{S.view=v;persist();render();window.scrollTo(0,0)};
+
+function hero(){
+ return `<div class="hero-intro">
+  <p class="kicker">Universidad Católica de Oriente</p>
+  <h1>Diagnóstico empresarial para tu empresa</h1>
+  <p class="lead">Evalúa qué tan desarrolladas están las prácticas de gestión de tu empresa en seis áreas. Las preguntas se ajustan a tu tipo de empresa. Al terminar, el equipo del diagnóstico analizará tus respuestas y preparará el informe de tu empresa.</p>
+  <div class="hexline">${AREAS.map(a=>`<span>${esc(a.name)}</span>`).join("")}</div>
+ </div>`;
+}
+
+function renderAcceso(){
+ app.innerHTML=`<div class="intro">${hero()}
+  <form class="panel access" id="af" novalidate>
+   <h2>Ingresa con el NIT de tu empresa</h2>
+   <p class="muted">El código de acceso es opcional. Si lo usas, el avance se guarda automáticamente y la próxima vez los datos de tu empresa se llenarán solos.</p>
+   <div class="row2">
+    <label>NIT de la empresa *<input name="nit" inputmode="numeric" autocomplete="off" value="${esc(S.nit)}" placeholder="Ej.: 900123456"><span class="hint">Sin el dígito de verificación.</span></label>
+    <label>Código de acceso (opcional)<input name="codigo" type="password" autocomplete="off" minlength="4" value=""><span class="hint">Si es la primera vez, crea uno de al menos 4 caracteres y guárdalo. Si lo dejas vacío, respondes sin guardar avance ni autocompletar.</span></label>
+   </div>
+   ${S.msg?`<p class="notice ${S.msg.err?"err":""}">${esc(S.msg.t)}</p>`:""}
+   <div class="row"><button class="btn" type="submit" id="abtn">Continuar</button><span class="muted">Toma entre 20 y 30 minutos. Puedes pausar y continuar después.</span></div>
+  </form></div>`;
+ const f=document.getElementById("af");
+ f.onsubmit=async ev=>{
+  ev.preventDefault();const d=new FormData(f);
+  const nit=String(d.get("nit")||"").split("-")[0].replace(/\D/g,"");const code=String(d.get("codigo")||"");
+  const fail=t=>{S.msg={t,err:true};S.nit=nit;renderAcceso()};
+  if(nit.length<6||nit.length>12)return fail("Escribe un NIT válido, solo números y sin el dígito de verificación.");
+  if(code.length>0&&code.length<4)return fail("El código de acceso debe tener al menos 4 caracteres, o déjalo vacío para responder sin guardar avance.");
+  if(!code){S=Object.assign(blank(),{nit});S.empresa.nit=nit;S.msg={t:"Vas a responder sin código de acceso: el avance no se guardará si cierras la página antes de enviar."};go("perfil");return}
+  const btn=document.getElementById("abtn");btn.disabled=true;btn.textContent="Buscando…";
+  let r;try{r=await Store.load(nit,code)}catch(e){btn.disabled=false;btn.textContent="Continuar";return fail("No pudimos conectarnos. Revisa tu conexión e inténtalo de nuevo.")}
+  if(r.estado==="codigo_incorrecto")return fail("Este NIT ya está registrado y el código no coincide. Escribe el código que se creó la primera vez. Si lo olvidaste, pide al equipo del diagnóstico que lo restablezca.");
+  if(r.estado==="bloqueado")return fail("Por seguridad, este NIT quedó bloqueado 15 minutos tras varios intentos fallidos. Inténtalo más tarde.");
+  if(r.estado!=="ok"&&r.estado!=="nuevo")return fail("Revisa el NIT y el código e inténtalo de nuevo.");
+  const fresh=blank();
+  S=Object.assign(fresh,{nit,codigo:code});
+  if(r.estado==="ok"){
+   const dt=r.datos||{};
+   S.empresa=Object.assign(blankEmpresa(),dt.empresa||{});S.perfil=dt.perfil||{};S.consent=!!dt.consent;
+   S.answers=r.respuestas||{};S.ultimo_envio=r.ultimo_envio||null;
+   S.msg={t:`Encontramos los datos de ${S.empresa.nombre||"tu empresa"} y los cargamos. Revisa que sigan vigentes.`+(S.ultimo_envio?` Su último diagnóstico se envió el ${new Date(S.ultimo_envio).toLocaleDateString("es-CO",{year:"numeric",month:"long",day:"numeric"})}; puedes actualizar las respuestas y enviarlo de nuevo.`:"")};
+  }else{
+   S.msg={t:"Es la primera vez que se registra este NIT. El código que escribiste queda como código de acceso de la empresa."};
+  }
+  S.empresa.nit=nit;
+  go("perfil");
+ };
+}
+
+function renderPerfil(){
+ const e=S.empresa,p=S.perfil;
+ const opt=(arr,v)=>arr.map(o=>`<option ${o===v?"selected":""}>${esc(o)}</option>`).join("");
+ app.innerHTML=`
+ <div class="areahead"><p class="muted">Paso 1 de 2 · NIT ${esc(S.nit)}</p><h1 style="font-size:clamp(1.6rem,4vw,2.2rem)">Datos y perfil de la empresa</h1></div>
+ ${S.msg?`<p class="notice" style="margin:12px 0">${esc(S.msg.t)}</p>`:""}
+ <form class="panel form" id="pf" novalidate style="margin-top:12px">
+  <label class="full">Nombre de la empresa *<input name="nombre" value="${esc(e.nombre)}" autocomplete="organization"></label>
+  <label>Tamaño *<select name="tamano"><option value="">Selecciona…</option>${opt(["Microempresa (hasta 10 trabajadores)","Pequeña (11 a 50 trabajadores)","Mediana (51 a 200 trabajadores)"],e.tamano)}</select></label>
+  <label>Ciudad<input name="ciudad" value="${esc(e.ciudad)}"></label>
+  <label>Persona que responde<input name="responsable" value="${esc(e.responsable)}" autocomplete="name"></label>
+  <label>Cargo<input name="cargo" value="${esc(e.cargo)}"></label>
+  <label>Correo de contacto<input name="correo" type="email" value="${esc(e.correo)}" autocomplete="email"></label>
+  <label>Celular<input name="celular" inputmode="tel" value="${esc(e.celular)}" autocomplete="tel"></label>
+  <fieldset class="full fieldset"><legend>Actividad principal *</legend>
+   <div class="choice">${ACTIVIDADES.map(a=>`<label><input type="radio" name="act" value="${a.k}" ${p.act===a.k?"checked":""}>${esc(a.name)}</label>`).join("")}</div>
+  </fieldset>
+  <label class="full">Número de trabajadores directos (con contrato laboral) *<input name="trab" type="number" min="0" step="1" inputmode="numeric" value="${p.trab!=null?esc(p.trab):""}" style="max-width:200px"><span class="hint">Escribe 0 si la empresa no tiene trabajadores con contrato laboral. En ese caso no se evalúa Gestión humana.</span></label>
+  <fieldset class="full fieldset"><legend>Perfil de operación *</legend>
+   <p class="hint" style="margin-top:-4px">Con estas respuestas se activan solo las preguntas que aplican a tu empresa.</p>
+   <div>${PERFIL.map(f=>`<div class="yn"><span class="q">${esc(f.q)}${f.help?`<small>${esc(f.help)}</small>`:""}</span><span class="seg" role="group" aria-label="${esc(f.q)}"><button type="button" data-f="${f.k}" data-v="1" aria-pressed="${p[f.k]===true}">Sí</button><button type="button" data-f="${f.k}" data-v="0" aria-pressed="${p[f.k]===false}">No</button></span></div>`).join("")}</div>
+  </fieldset>
+  <label class="full consent"><input type="checkbox" name="consent" ${S.consent?"checked":""}><span>Autorizo el tratamiento de los datos suministrados con fines académicos y de diagnóstico empresarial, conforme a la Ley 1581 de 2012. Las respuestas serán conocidas únicamente por el equipo responsable del diagnóstico. *</span></label>
+  <p class="full pending" id="perr" hidden></p>
+  <div class="full row"><button class="btn ghost" type="button" id="exit">Salir</button><button class="btn" type="submit">Continuar al cuestionario</button></div>
+  <div class="full savebar"><span id="savest">${saveLabel()}</span></div>
+ </form>`;
+ const f=document.getElementById("pf");
+ const read=()=>{const d=new FormData(f);["nombre","tamano","ciudad","responsable","cargo","correo","celular"].forEach(k=>S.empresa[k]=String(d.get(k)||"").trim());
+  if(d.get("act"))S.perfil.act=String(d.get("act"));const t=String(d.get("trab")||"").trim();S.perfil.trab=t===""?null:Math.max(0,parseInt(t,10)||0);S.consent=!!d.get("consent")};
+ f.addEventListener("input",()=>{read();S.msg=null;queueSave()});f.addEventListener("change",()=>{read();queueSave()});
+ f.querySelectorAll(".seg button").forEach(b=>b.onclick=()=>{S.perfil[b.dataset.f]=b.dataset.v==="1";b.parentElement.querySelectorAll("button").forEach(o=>o.setAttribute("aria-pressed",String(o===b)));queueSave()});
+ document.getElementById("exit").onclick=salir;
+ f.onsubmit=ev=>{ev.preventDefault();read();
+  const miss=[];if(!S.empresa.nombre)miss.push("nombre de la empresa");if(!S.empresa.tamano)miss.push("tamaño");if(!S.perfil.act)miss.push("actividad principal");if(S.perfil.trab==null)miss.push("número de trabajadores");
+  const nf=PERFIL.filter(x=>typeof S.perfil[x.k]!=="boolean").length;if(nf)miss.push(`${nf} pregunta${nf>1?"s":""} del perfil de operación`);if(!S.consent)miss.push("autorización de datos");
+  const pe=document.getElementById("perr");if(miss.length){pe.hidden=false;pe.textContent="Falta completar: "+miss.join(", ")+".";return}
+  S.msg=null;S.area=firstArea();saveNow();go("cuestionario")};
+}
+
+function salir(){const had=!!S.codigo,sent=S.enviado&&S.view==="resultados";saveNow();const nit=S.nit;S=blank();S.nit=nit;
+ S.msg=sent?null:{t:had?"Tu avance quedó guardado. Para continuar, ingresa de nuevo con el NIT y el código de acceso.":"Saliste sin código de acceso, así que el avance no se guardó."};persist();render();window.scrollTo(0,0)}
+const activeAreas=()=>AREAS.map((a,i)=>({a,i})).filter(x=>areaApplies(x.a,S.perfil));
+const firstArea=()=>(activeAreas()[0]||{i:0}).i;
+function areaDone(a){let t=0,d=0;a.subs.forEach(s=>s.items.forEach(it=>{if(itemApplies(a,s,it,S.perfil)){t++;if(S.answers[it.id]!=null)d++}}));return t?d/t:1}
+function stepsHTML(){
+ return `<nav class="steps" aria-label="Áreas del diagnóstico">${AREAS.map((a,i)=>{const on=areaApplies(a,S.perfil);return `<button class="step ${i===S.area?"on":""}" data-go="${i}" ${on?"":"disabled"} aria-current="${i===S.area?"step":"false"}"><span class="bar"><i style="width:${on?Math.round(areaDone(a)*100):0}%"></i></span><span class="nm">${esc(a.short||a.name)}${on?"":` <span class="nap">(no aplica)</span>`}</span></button>`}).join("")}</nav>`;
+}
+function bindSteps(){document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>{S.area=+b.dataset.go;persist();saveNow();render();window.scrollTo(0,0)})}
+function topbar(){const pr=progress(rec());return `${stepsHTML()}<div class="savebar"><span>${pr.done} de ${pr.total} prácticas respondidas</span><span id="savest">${saveLabel()}</span></div>`}
+
+function renderQ(){
+ if(!areaApplies(AREAS[S.area],S.perfil))S.area=firstArea();
+ const act=activeAreas();const pos=act.findIndex(x=>x.i===S.area);
+ const a=AREAS[S.area];const last=pos===act.length-1;
+ app.innerHTML=`
+ <div class="topbar" id="tb">${topbar()}</div>
+ <div class="areahead">
+  <p class="muted">Área ${pos+1} de ${act.length} · ${esc(S.empresa.nombre)}</p>
+  <h2>${esc(a.name)}</h2>
+  <p class="muted">Indica en qué nivel está cada práctica en tu empresa hoy.</p>
+ </div>
+ <details class="scalehelp"><summary>Ver qué significa cada nivel</summary><dl>${SCALE.map(s=>`<dt>${s.v}. ${esc(s.name)}</dt><dd>${esc(s.desc)}</dd>`).join("")}</dl></details>
+ ${a.subs.map(s=>{
+  if(!subApplies(a,s,S.perfil))return "";
+  const its=s.items.filter(it=>itemApplies(a,s,it,S.perfil));const skipped=s.items.length-its.length;
+  if(!its.length)return "";
+  return `<div class="sub"><h3>${esc(s.name)}</h3>${skipped?`<p class="subnote">${skipped} práctica${skipped>1?"s":""} de esta sección no aplica${skipped>1?"n":""} según el perfil de tu empresa.</p>`:""}
+  ${its.map(it=>{const v=S.answers[it.id];return `
+   <div class="item" id="it-${it.id}">
+    <p><span class="code">${it.id}</span>${esc(it.t)}</p>
+    ${it.help?`<details class="glosa"><summary>¿Qué significa?</summary><p>${esc(it.help)}</p></details>`:""}
+    <div class="mat" role="radiogroup" aria-label="Nivel de la práctica ${it.id}">
+     ${SCALE.map(x=>`<button type="button" role="radio" data-k="${it.id}" data-v="${x.v}" aria-checked="${v===x.v}" title="${esc(x.desc)}"><b>${x.v}</b><span>${esc(x.name)}</span></button>`).join("")}
+    </div>
+    ${it.opt?`<button type="button" class="nabtn" role="radio" data-k="${it.id}" data-v="0" aria-checked="${v===0}">No aplica para mi empresa</button>`:""}
+   </div>`}).join("")}</div>`}).join("")}
+ <div class="navbar">
+  <button class="btn ghost" id="prev">${pos===0?"Volver al perfil":"Área anterior"}</button>
+  <button class="btn" id="next">${last?"Enviar respuestas":"Siguiente área"}</button>
+ </div>
+ <p class="pending" id="pend" hidden></p>
+ <p style="margin-top:18px"><button class="linkbtn" id="exit">${S.codigo?"Guardar y salir":"Salir"}</button></p>`;
+ app.querySelectorAll("[data-k]").forEach(b=>b.addEventListener("click",()=>{
+  const k=b.dataset.k,v=+b.dataset.v;S.answers[k]=v;
+  document.querySelectorAll(`[data-k="${k}"]`).forEach(o=>o.setAttribute("aria-checked",String(+o.dataset.v===v)));
+  document.getElementById("tb").innerHTML=topbar();bindSteps();queueSave();
+ }));
+ document.getElementById("exit").onclick=salir;
+ document.getElementById("prev").onclick=()=>{if(pos===0){saveNow();go("perfil");return}S.area=act[pos-1].i;saveNow();go("cuestionario")};
+ document.getElementById("next").onclick=()=>{
+  if(!last){S.area=act[pos+1].i;saveNow();go("cuestionario");return}
+  const p=pending(rec());
+  if(p.length){
+   const pe=document.getElementById("pend");pe.hidden=false;
+   pe.textContent=`Faltan ${p.length} práctica${p.length>1?"s":""} por responder (${p.slice(0,8).join(", ")}${p.length>8?"…":""}). Te llevamos a la primera pendiente.`;
+   const k=p[0];const ai=AREAS.findIndex(x=>x.subs.some(s=>s.items.some(it=>it.id===k)));
+   setTimeout(()=>{S.area=ai;persist();render();const el=document.getElementById("it-"+k);if(el)el.scrollIntoView({block:"center"})},1400);
+   return;
+  }
+  S.fecha=new Date().toISOString();S.enviado=false;S.subId=uuid();go("resultados");
+ };
+ bindSteps();
+}
+
+async function enviar(){
+ const r=compute(rec());
+ const row={id:S.subId||uuid(),nit:S.nit,empresa:Object.assign({},S.empresa,{nit:S.nit}),perfil:S.perfil,respuestas:S.answers,no_ce:!areaApplies(AREAS.find(a=>a.id==="ce"),S.perfil),
+  puntaje_global:+r.global.toFixed(2),nivel:levelOf(r.global).name,alertas:r.alerts.length,version:D.VERSION};
+ try{await Store.submit(row);await saveNow(true);return true}catch(e){return false}
+}
+
+function renderR(){
+ if(pending(rec()).length){go("cuestionario");return}
+ const fecha=new Date(S.fecha||Date.now()).toLocaleDateString("es-CO",{year:"numeric",month:"long",day:"numeric"});
+ app.innerHTML=`
+ <div class="sent" id="sendbox">${S.enviado?"Tus respuestas quedaron registradas.":"Registrando tus respuestas…"}</div>
+ <div class="panel" style="display:grid;gap:14px">
+  <p class="muted">${esc(fecha)} · NIT ${esc(S.nit)}</p>
+  <h1 style="font-size:clamp(1.7rem,4.5vw,2.4rem)">¡Gracias, ${esc(S.empresa.nombre)}!</h1>
+  <p>Recibimos el diagnóstico de tu empresa. El equipo del diagnóstico empresarial de la Universidad Católica de Oriente analizará las respuestas y te compartirá el informe con el nivel de madurez de cada área, las alertas encontradas y un plan de acción priorizado.</p>
+  ${S.empresa.correo||S.empresa.celular?`<p class="muted">Te contactaremos ${esc([S.empresa.correo&&("al correo "+S.empresa.correo),S.empresa.celular&&("al celular "+S.empresa.celular)].filter(Boolean).join(" o "))}.</p>`:`<p class="muted">Como no dejaste correo ni celular de contacto, comunícate con el equipo del diagnóstico para recibir tu informe.</p>`}
+ </div>
+ <div class="actions">
+  ${S.codigo?`<button class="btn ghost" id="edit">Corregir respuestas</button>`:""}
+  <button class="btn" id="out">Terminar</button>
+ </div>`;
+ const ed=document.getElementById("edit");if(ed)ed.onclick=()=>{S.area=firstArea();go("cuestionario")};
+ document.getElementById("out").onclick=salir;
+ if(!S.enviado)doSend();
+}
+async function doSend(){
+ const box=document.getElementById("sendbox");
+ const ok=await enviar();
+ if(ok){S.enviado=true;S.ultimo_envio=new Date().toISOString();persist();if(box){box.className="sent";box.textContent="Tus respuestas quedaron registradas."}return}
+ if(box){box.className="sent err";box.innerHTML=`<span>No pudimos registrar tus respuestas. Revisa tu conexión e inténtalo de nuevo.</span><button class="btn" id="retry">Reintentar envío</button>`;
+  document.getElementById("retry").onclick=()=>{box.className="sent";box.textContent="Registrando tus respuestas…";doSend()}}
+}
+
+render();
+})();
+</script>
+</body>
+</html>

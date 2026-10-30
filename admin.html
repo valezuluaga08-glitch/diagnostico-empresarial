@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Panel de resultados</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="icon" type="image/png" href="logo-uco-icono.png">
+<link rel="stylesheet" href="estilos.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="config.js"></script>
+<script src="banco.js"></script>
+<script src="nucleo.js"></script>
+<script src="logos.js"></script>
+</head>
+<body>
+<header class="brandbar wide"><div class="in"><img src="logo-uco.png" alt="Universidad Católica de Oriente" width="140" height="52"><p class="sp"><b>Panel de resultados</b>Diagnóstico empresarial</p></div></header>
+<main class="wrap" id="app" aria-live="polite" style="max-width:1080px"></main>
+
+<script>
+(function(){
+"use strict";
+const D=window.DIAG;
+const {AREAS,SCALE,PERFIL,ACTIVIDADES,LEVELS,levelOf,levelIdx,esc,fmt,scaleName,areaApplies,itemApplies,progress,compute,summaryText,perfilLines,radarSVG,buildPDF}=D;
+const app=document.getElementById("app");
+const CFG=window.DIAG_CONFIG||{};
+const configured=CFG.SUPABASE_URL&&!/TU-PROYECTO/.test(CFG.SUPABASE_URL)&&CFG.SUPABASE_ANON_KEY&&!/PEGA_AQUI/.test(CFG.SUPABASE_ANON_KEY);
+let db=null;
+try{if(configured&&window.supabase)db=window.supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY)}catch(e){}
+
+let session=null,rows=[],emps=[],query="",current=null,loadErr="",loading=false,timer=null;
+const isV4=row=>row.version===D.VERSION;
+const toRec=row=>({empresa:row.empresa||{},perfil:row.perfil||{},answers:row.respuestas||{}});
+const actName=p=>((ACTIVIDADES.find(a=>a.k===(p||{}).act)||{}).name||"").replace(/ \(.*\)/,"");
+const fdate=(iso,long)=>iso?new Date(iso).toLocaleString("es-CO",long?{year:"numeric",month:"long",day:"numeric",hour:"2-digit",minute:"2-digit"}:{year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—";
+const slug=s=>(s||"empresa").normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-zA-Z0-9]+/g,"_").replace(/^_|_$/g,"").toLowerCase()||"empresa";
+function download(name,blob){const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
+
+/* ---------- Sesión ---------- */
+async function init(){
+ if(!db){app.innerHTML=`<div class="login panel"><h2>Panel de resultados</h2><p class="muted">La plataforma todavía no está conectada a la base de datos. Abre el archivo <strong>config.js</strong> y pega la dirección y la clave pública de tu proyecto de Supabase.</p></div>`;return}
+ const {data}=await db.auth.getSession();session=data.session;
+ db.auth.onAuthStateChange((_e,s)=>{const was=!!session;session=s;if(!!s!==was)route()});
+ route();
+}
+function route(){
+ clearInterval(timer);
+ if(!session){renderLogin();return}
+ if(current)renderDetail();else{renderList();load()}
+ timer=setInterval(()=>{if(!current&&!document.hidden)load(true)},60000);
+}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden&&session&&!current)load(true)});
+
+function renderLogin(){
+ app.innerHTML=`
+ <form class="login panel" id="lf" novalidate>
+  <h2>Panel de resultados</h2>
+  <p class="muted">Acceso exclusivo para el equipo administrador del diagnóstico.</p>
+  <label>Correo<input type="email" name="email" autocomplete="username"></label>
+  <label>Contraseña<input type="password" name="password" autocomplete="current-password"></label>
+  <p class="pending" id="lerr" hidden></p>
+  <button class="btn" type="submit" id="lbtn">Ingresar</button>
+ </form>`;
+ const f=document.getElementById("lf");
+ f.onsubmit=async ev=>{
+  ev.preventDefault();const d=new FormData(f);const btn=document.getElementById("lbtn"),err=document.getElementById("lerr");
+  if(!d.get("email")||!d.get("password")){err.hidden=false;err.textContent="Escribe tu correo y tu contraseña.";return}
+  btn.disabled=true;btn.textContent="Ingresando…";err.hidden=true;
+  const {data,error}=await db.auth.signInWithPassword({email:String(d.get("email")).trim(),password:String(d.get("password"))});
+  if(error){btn.disabled=false;btn.textContent="Ingresar";err.hidden=false;err.textContent=/invalid/i.test(error.message)?"Correo o contraseña incorrectos.":"No se pudo iniciar sesión. Intenta de nuevo.";return}
+  session=data.session;route();
+ };
+}
+
+/* ---------- Datos ---------- */
+async function load(){
+ if(loading)return;loading=true;
+ const [a,b]=await Promise.all([
+  db.from("diagnosticos").select("*").order("created_at",{ascending:false}),
+  db.from("empresas").select("nit,datos,respuestas,actualizado,ultimo_envio,creado,codigo_hash").order("actualizado",{ascending:false})
+ ]);
+ loading=false;
+ if(a.error){loadErr="No se pudieron cargar los resultados. Revisa tu conexión y vuelve a intentarlo."}
+ else{loadErr="";rows=a.data||[]}
+ emps=b.error?[]:(b.data||[]);
+ if(!current&&session)renderList();
+}
+
+/* ---------- Lista ---------- */
+function filtered(){
+ const q=query.trim().toLowerCase();if(!q)return rows;
+ return rows.filter(r=>{const e=r.empresa||{};return [e.nombre,r.nit,e.nit,e.ciudad,e.responsable,e.correo].join(" ").toLowerCase().includes(q)});
+}
+function renderList(){
+ const v4=rows.filter(isV4);const list=filtered();
+ const avg=v4.length?v4.reduce((t,r)=>t+(+r.puntaje_global||0),0)/v4.length:0;
+ const withAlerts=v4.filter(r=>(r.alertas||0)>0).length;
+ const prog=emps.filter(e=>!e.ultimo_envio);
+ let weakest="—";
+ if(v4.length){const acc={};v4.forEach(r=>compute(toRec(r)).areas.forEach(a=>{(acc[a.name]=acc[a.name]||[]).push(a.score)}));
+  const m=Object.entries(acc).map(([k,v])=>[k,v.reduce((x,y)=>x+y,0)/v.length]).sort((x,y)=>x[1]-y[1])[0];if(m)weakest=`${m[0]} (${fmt(m[1])})`}
+ const hadFocus=document.activeElement&&document.activeElement.id==="q";
+ app.innerHTML=`
+ <div class="adminbar">
+  <div><p class="muted">Panel de resultados</p><h1 style="font-size:clamp(1.6rem,4vw,2.2rem)">Diagnósticos recibidos</h1></div>
+  <div class="row"><span class="muted">${esc(session.user.email)}</span><button class="btn ghost" id="out">Cerrar sesión</button></div>
+ </div>
+ <div class="kpis">
+  <div class="kpi"><b>${v4.length}</b><span>Diagnósticos enviados</span></div>
+  <div class="kpi"><b>${v4.length?fmt(avg):"—"}</b><span>Puntaje global promedio</span></div>
+  <div class="kpi"><b>${withAlerts}</b><span>Con alertas críticas</span></div>
+  <div class="kpi"><b>${prog.length}</b><span>Empresas en progreso</span></div>
+  <div class="kpi"><b style="font-size:1.1rem;padding:6px 0">${esc(weakest)}</b><span>Área más débil en promedio</span></div>
+ </div>
+ <div class="tools">
+  <input id="q" type="search" placeholder="Buscar empresa, NIT, ciudad, persona…" value="${esc(query)}" aria-label="Buscar">
+  <button class="btn ghost" id="refresh">Actualizar</button>
+  <button class="btn" id="xlsx" ${v4.length?"":"disabled"}>Descargar todo en Excel</button>
+ </div>
+ ${loadErr?`<p class="pending">${esc(loadErr)}</p>`:""}
+ <div class="tablewrap">
+ ${list.length?`<table class="list"><thead><tr><th>Fecha</th><th>Empresa</th><th>Actividad</th><th>Tamaño</th><th>Puntaje</th><th>Nivel</th><th>Alertas</th></tr></thead><tbody>
+  ${list.map(r=>{const e=r.empresa||{};const s=+r.puntaje_global;const lv=levelOf(s);const nit=r.nit||e.nit;
+   return `<tr data-id="${esc(r.id)}" tabindex="0"><td>${esc(fdate(r.created_at))}</td><td><strong>${esc(e.nombre)}</strong>${nit?`<br><span class="muted">NIT ${esc(nit)}</span>`:""}</td><td>${esc(actName(r.perfil))}</td><td>${esc((e.tamano||"").replace(/ \(.*\)/,""))}</td>
+   ${isV4(r)?`<td class="num">${fmt(s)}</td><td><span class="tag" style="background:var(${lv.c})">${esc(lv.name)}</span></td><td>${r.alertas?`<span class="tag red">${r.alertas}</span>`:"0"}</td>`:`<td colspan="3" class="muted">Versión anterior del cuestionario</td>`}</tr>`}).join("")}
+ </tbody></table>`:`<p class="empty">${rows.length?"Ningún diagnóstico coincide con la búsqueda.":(loading?"Cargando resultados…":"Todavía no hay diagnósticos enviados. Aparecerán aquí apenas una empresa termine el cuestionario.")}</p>`}
+ </div>
+
+ <section class="block">
+  <h2>Empresas registradas</h2>
+  <p class="muted" style="margin:6px 0 12px">Cada empresa queda registrada por su NIT. Aquí ves su avance, aunque todavía no haya enviado el diagnóstico.</p>
+  <p class="note" id="empmsg"></p>
+  <div class="tablewrap">${emps.length?`<table class="list"><thead><tr><th>NIT</th><th>Empresa</th><th>Avance</th><th>Última actualización</th><th>Último envío</th><th>Código</th></tr></thead><tbody>
+   ${emps.map(x=>{const dt=x.datos||{};const pr=progress({perfil:dt.perfil||{},answers:x.respuestas||{}});const pct=pr.total?Math.round(pr.done/pr.total*100):0;
+    return `<tr style="cursor:default"><td>${esc(x.nit)}</td><td><strong>${esc((dt.empresa||{}).nombre||"—")}</strong></td><td class="num">${pct} %</td><td>${esc(fdate(x.actualizado))}</td><td>${x.ultimo_envio?esc(fdate(x.ultimo_envio)):`<span class="muted">Sin enviar</span>`}</td>
+    <td>${x.codigo_hash?`<button class="linkbtn" data-reset="${esc(x.nit)}">Restablecer</button>`:`<span class="muted">Restablecido</span>`}</td></tr>`}).join("")}
+  </tbody></table>`:`<p class="empty">Todavía no hay empresas registradas.</p>`}</div>
+ </section>`;
+ document.getElementById("out").onclick=async()=>{await db.auth.signOut();session=null;rows=[];emps=[];current=null;route()};
+ document.getElementById("refresh").onclick=()=>load();
+ const q=document.getElementById("q");
+ q.oninput=()=>{query=q.value;renderList();const n=document.getElementById("q");n.focus();n.setSelectionRange(n.value.length,n.value.length)};
+ if(hadFocus){q.focus();q.setSelectionRange(q.value.length,q.value.length)}
+ document.getElementById("xlsx").onclick=exportXLSX;
+ app.querySelectorAll("tr[data-id]").forEach(tr=>{
+  const open=()=>{current=rows.find(r=>r.id===tr.dataset.id);route();window.scrollTo(0,0)};
+  tr.onclick=open;tr.onkeydown=e=>{if(e.key==="Enter")open()};
+ });
+ app.querySelectorAll("[data-reset]").forEach(b=>b.onclick=async()=>{
+  const nit=b.dataset.reset;const msg=document.getElementById("empmsg");
+  if(b.dataset.confirm!=="1"){b.dataset.confirm="1";b.textContent="¿Confirmar?";msg.textContent=`Al restablecer, el próximo código que se escriba con el NIT ${nit} quedará como el nuevo. Haz clic en «¿Confirmar?» para continuar.`;return}
+  const {error}=await db.from("empresas").update({codigo_hash:null,intentos:0,bloqueado_hasta:null}).eq("nit",nit);
+  msg.textContent=error?"No se pudo restablecer el código. Intenta de nuevo.":`Código restablecido para el NIT ${nit}. Avísale a la empresa que ingrese con un código nuevo.`;
+  if(!error){const x=emps.find(e=>e.nit===nit);if(x)x.codigo_hash=null;setTimeout(renderList,2500)}
+ });
+}
+
+/* ---------- Excel ---------- */
+function exportXLSX(){
+ if(!window.XLSX){alert("No se pudo cargar el generador de Excel. Revisa tu conexión y recarga la página.");return}
+ const resumen=[],resp=[],alertas=[];
+ rows.filter(isV4).forEach(row=>{
+  const rec=toRec(row),r=compute(rec),e=rec.empresa,p=rec.perfil;
+  const base={"Fecha":fdate(row.created_at),"NIT":row.nit||e.nit,"Empresa":e.nombre,"Actividad":actName(p),"Tamaño":e.tamano,"Trabajadores directos":+p.trab||0,"Ciudad":e.ciudad,"Respondió":e.responsable,"Cargo":e.cargo,"Correo":e.correo,"Celular":e.celular};
+  const s=Object.assign({},base,{"Puntaje global":+r.global.toFixed(2),"Nivel":levelOf(r.global).name,"Alertas críticas":r.alerts.length});
+  AREAS.forEach(a=>{const ar=r.areas.find(x=>x.id===a.id);s[a.name]=ar?+ar.score.toFixed(2):"No aplica"});
+  AREAS.forEach(a=>a.subs.forEach(su=>{const ar=r.areas.find(x=>x.id===a.id);const sb=ar&&ar.subs.find(x=>x.name===su.name);s[`${a.short||a.name}: ${su.name}`]=sb?+sb.score.toFixed(2):"No aplica"}));
+  PERFIL.forEach(f=>{s["Perfil: "+f.q.replace(/^¿|\?$/g,"")]=p[f.k]===true?"Sí":(p[f.k]===false?"No":"")});
+  resumen.push(s);
+  const q=Object.assign({},base);
+  AREAS.forEach(a=>a.subs.forEach(su=>su.items.forEach(it=>{const v=rec.answers[it.id];q[it.id]=!itemApplies(a,su,it,p)?"No aplica (perfil)":(v===0?"No aplica":(v||""))})));
+  resp.push(q);
+  r.alerts.forEach(x=>alertas.push({"Fecha":base.Fecha,"NIT":base.NIT,"Empresa":base.Empresa,"Código":x.id,"Área":x.area,"Sub-dimensión":x.sub,"Práctica":x.t,"Nivel":`${x.v} · ${scaleName(x.v)}`}));
+ });
+ const preguntas=[];AREAS.forEach(a=>a.subs.forEach(su=>su.items.forEach(it=>preguntas.push({"Código":it.id,"Área":a.name,"Sub-dimensión":su.name,"Práctica":it.t,"Aplica a":[a.cond,su.cond,it.cond].filter(Boolean).join(" ; ")||"Todas","Crítica":it.crit?"Sí":"","Admite No aplica":it.opt?"Sí":"","Glosa":it.help||""}))));
+ const wb=XLSX.utils.book_new();
+ const add=(data,name,cols)=>{const ws=XLSX.utils.json_to_sheet(data.length?data:[{"Sin datos":""}]);if(cols)ws["!cols"]=cols;XLSX.utils.book_append_sheet(wb,ws,name)};
+ add(resumen,"Resumen",resumen[0]?Object.keys(resumen[0]).map(k=>({wch:Math.max(10,Math.min(32,k.length+2))})):null);
+ add(alertas,"Alertas críticas",[{wch:20},{wch:12},{wch:28},{wch:8},{wch:18},{wch:28},{wch:80},{wch:14}]);
+ add(resp,"Respuestas");
+ add(preguntas,"Prácticas",[{wch:8},{wch:20},{wch:30},{wch:80},{wch:14},{wch:8},{wch:10},{wch:60}]);
+ const out=XLSX.write(wb,{bookType:"xlsx",type:"array"});
+ const d=new Date();const stamp=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+ download(`diagnosticos_${stamp}.xlsx`,new Blob([out],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));
+}
+
+/* ---------- Detalle ---------- */
+function renderDetail(){
+ const row=current;
+ if(!isV4(row)){
+  app.innerHTML=`<div class="adminbar"><button class="btn ghost" id="back">← Volver a la lista</button><button class="btn ghost danger" id="del">Eliminar</button></div>
+  <div class="confirm" id="conf" style="margin-bottom:16px"><span>¿Eliminar este diagnóstico? No se puede deshacer.</span><button class="btn danger solid" id="yes">Eliminar</button><button class="btn ghost" id="no">Cancelar</button></div>
+  <div class="panel"><h2>${esc((row.empresa||{}).nombre)}</h2><p class="muted" style="margin-top:8px">Este registro se hizo con una versión anterior del cuestionario, con otra escala y otras preguntas. Sus resultados no se pueden calcular con el instrumento actual. Si era una prueba, puedes eliminarlo.</p></div>`;
+  bindDetail(row);return;
+ }
+ const rec=toRec(row),r=compute(rec),e=rec.empresa;
+ const lv=levelOf(r.global),li=levelIdx(r.global);
+ const cs=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+ const colors={line:cs("--line"),fill:cs("--primary"),ink:cs("--ink"),muted:cs("--muted")};
+ app.innerHTML=`
+ <div class="adminbar">
+  <button class="btn ghost" id="back">← Volver a la lista</button>
+  <div class="row"><button class="btn" id="pdf">Descargar PDF</button><button class="btn ghost danger" id="del">Eliminar</button></div>
+ </div>
+ <div class="confirm" id="conf" style="margin-bottom:16px"><span>¿Eliminar este diagnóstico? No se puede deshacer.</span><button class="btn danger solid" id="yes">Eliminar</button><button class="btn ghost" id="no">Cancelar</button></div>
+ <p class="note" id="msg"></p>
+ <div class="reshead">
+  <p class="muted">Recibido el ${esc(fdate(row.created_at,true))}</p>
+  <h1>${esc(e.nombre)}</h1>
+  <p class="muted">${esc([`NIT ${row.nit||e.nit||""}`,actName(rec.perfil),e.tamano,e.ciudad].filter(Boolean).join(" · "))}</p>
+  <p class="muted">${esc([e.responsable,e.cargo,e.correo,e.celular].filter(Boolean).join(" · "))}</p>
+ </div>
+ <div class="panel hero">
+  <div class="radar">${radarSVG(r.areas,colors)}</div>
+  <div class="level">
+   <p class="muted">Puntaje global</p>
+   <p class="score">${fmt(r.global)} <small>de 5</small></p>
+   <p><span class="tag" style="background:var(${lv.c})">Nivel ${esc(lv.name.toLowerCase())}</span> ${r.alerts.length?`<span class="tag red">${r.alerts.length} alerta${r.alerts.length>1?"s":""} crítica${r.alerts.length>1?"s":""}</span>`:""}</p>
+   <div class="ladder" aria-hidden="true">${LEVELS.map((l,i)=>`<div style="${i<=li?`background:var(${l.c})`:""}"></div>`).join("")}</div>
+   <div class="ladder-labels" aria-hidden="true">${LEVELS.map(l=>`<span>${l.name}</span>`).join("")}</div>
+   <p>${esc(summaryText(r))}</p>
+  </div>
+ </div>
+ ${r.alerts.length?`<section class="block alerts"><h2>Alertas críticas</h2><ul>${r.alerts.map(x=>`<li><strong>${esc(x.t)}</strong><br><span>${esc(x.id)} · ${esc(x.area)} · ${esc(x.sub)} · ${esc(scaleName(x.v))}</span></li>`).join("")}</ul></section>`:""}
+ <section class="block"><h2>Puntaje por área</h2><div class="panel">
+  ${r.areas.map(a=>`<div class="arearow"><span>${esc(a.name)}</span><span class="track"><i style="width:${(a.score/5*100).toFixed(0)}%;background:var(${levelOf(a.score).c})"></i></span><span class="val">${fmt(a.score)}</span></div>`).join("")}
+  ${r.excluded.map(x=>`<p class="note">${esc(x.name)}: no aplica según el perfil.</p>`).join("")}
+ </div></section>
+ <section class="block"><h2>Detalle por sub-dimensión</h2><div class="panel">
+  ${r.areas.map(a=>`<details class="areadet"><summary><span>${esc(a.name)}</span><span>${fmt(a.score)} · ${esc(levelOf(a.score).name)}</span></summary>
+   ${a.subs.map(s=>`<div class="subrow"><span>${esc(s.name)}</span><span class="track"><i style="width:${(s.score/5*100).toFixed(0)}%;background:var(${levelOf(s.score).c})"></i></span><span class="val">${fmt(s.score)}</span></div>`).join("")}</details>`).join("")}
+ </div></section>
+ <section class="block two">
+  <div class="panel"><h2>Fortalezas</h2>${r.fort.length?`<ul>${r.fort.map(s=>`<li><strong>${esc(s.name)}</strong> <span class="muted">(${esc(s.area)}, ${fmt(s.score)})</span></li>`).join("")}</ul>`:`<p class="muted" style="margin-top:8px">Ninguna sub-dimensión alcanza el nivel consolidado.</p>`}</div>
+  <div class="panel"><h2>Debilidades</h2>${r.debil.length?`<ul>${r.debil.map(s=>`<li><strong>${esc(s.name)}</strong> <span class="muted">(${esc(s.area)}, ${fmt(s.score)})</span></li>`).join("")}</ul>`:`<p class="muted" style="margin-top:8px">No hay sub-dimensiones por debajo de 2,60.</p>`}</div>
+ </section>
+ <section class="block"><h2>Plan de acción priorizado</h2>
+  ${r.plan.length?`<div class="plan">${r.plan.map(p=>`<div class="planitem" style="border-left-color:var(${levelOf(p.score).c})"><div class="ph"><span>${esc(p.area)}: ${esc(p.name)}</span><span>Prioridad ${p.prio.toLowerCase()} · ${fmt(p.score)}</span></div><p>${esc(p.rec)}</p></div>`).join("")}</div>`:`<p class="panel">Todas las sub-dimensiones están en nivel consolidado o avanzado.</p>`}
+ </section>
+ <section class="block"><h2>Perfil de la empresa</h2><div class="panel resplist">
+  ${perfilLines(rec).map(([k,v])=>`<div class="resp"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}
+ </div></section>
+ <section class="block"><h2>Respuestas</h2>
+  ${AREAS.map(a=>{const on=areaApplies(a,rec.perfil);return `<details class="areadet panel" style="margin-bottom:10px;padding:14px 18px"><summary><span>${esc(a.name)}</span><span>${on?"":"No aplica"}</span></summary><div class="resplist">
+   ${a.subs.map(s=>s.items.map(it=>{const ap=itemApplies(a,s,it,rec.perfil);const v=rec.answers[it.id];
+    return `<div class="resp"><span><span class="muted">${it.id}.</span> ${esc(it.t)}${it.crit?` <span class="tag red" style="font-size:.7rem;padding:1px 7px">Crítica</span>`:""}</span><b style="color:${ap&&v>0?`var(${levelOf(v).c})`:"var(--muted)"}">${!ap?"No aplica (perfil)":(v===0?"No aplica":(v?`${v} · ${esc(scaleName(v))}`:"—"))}</b></div>`}).join("")).join("")}
+  </div></details>`}).join("")}
+ </section>`;
+ document.getElementById("pdf").onclick=()=>{
+  const msg=document.getElementById("msg");
+  if(!window.jspdf){msg.textContent="No se pudo cargar el generador de PDF. Revisa tu conexión y recarga la página.";return}
+  try{const buf=buildPDF(rec,r,fdate(row.created_at,true));download(`diagnostico_${slug(e.nombre)}.pdf`,new Blob([buf],{type:"application/pdf"}))}
+  catch(err){msg.textContent="No se pudo generar el PDF."}
+ };
+ bindDetail(row);
+}
+function bindDetail(row){
+ document.getElementById("back").onclick=()=>{current=null;route();window.scrollTo(0,0)};
+ document.getElementById("del").onclick=()=>document.getElementById("conf").classList.add("show");
+ document.getElementById("no").onclick=()=>document.getElementById("conf").classList.remove("show");
+ document.getElementById("yes").onclick=async()=>{
+  const {error}=await db.from("diagnosticos").delete().eq("id",row.id);
+  if(error){const m=document.getElementById("msg");if(m)m.textContent="No se pudo eliminar. Intenta de nuevo.";return}
+  rows=rows.filter(x=>x.id!==row.id);current=null;route();
+ };
+}
+
+init();
+})();
+</script>
+</body>
+</html>
